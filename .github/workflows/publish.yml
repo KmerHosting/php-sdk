@@ -34,6 +34,13 @@ jobs:
             exit 0
           fi
           curl --fail-with-body --silent --show-error --retry 3 \
+            --request PUT \
+            --header 'Content-Type: application/json' \
+            --header "Authorization: Bearer ${PACKAGIST_USERNAME}:${PACKAGIST_API_TOKEN}" \
+            --data '{"repository":"https://github.com/KmerHosting/php-sdk"}' \
+            https://packagist.org/api/packages/kmerhosting/sdk
+
+          curl --fail-with-body --silent --show-error --retry 3 \
             --request POST \
             --header 'Content-Type: application/json' \
             --header "Authorization: Bearer ${PACKAGIST_USERNAME}:${PACKAGIST_API_TOKEN}" \
