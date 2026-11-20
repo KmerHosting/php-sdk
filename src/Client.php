@@ -11,16 +11,18 @@ final class Client
 {
     private string $apiKey;
     private string $baseUrl;
+    private string $domainSearchUrl;
     /** @var callable|null */
     private $transport;
 
-    public function __construct(?string $apiKey = null, string $baseUrl = 'https://api.kmerhosting.com', private readonly int $timeout = 30, ?callable $transport = null)
+    public function __construct(?string $apiKey = null, string $baseUrl = 'https://api.kmerhosting.com', private readonly int $timeout = 30, ?callable $transport = null, string $domainSearchUrl = 'https://domain.kmerhosting.com')
     {
         $this->apiKey = $apiKey ?: (getenv('KMERHOSTING_API_KEY') ?: '');
         if ($this->apiKey === '') {
             throw new RuntimeException('Set KMERHOSTING_API_KEY or pass an API key to Client.');
         }
         $this->baseUrl = rtrim($baseUrl, '/');
+        $this->domainSearchUrl = rtrim($domainSearchUrl, '/');
         $this->transport = $transport;
     }
 
@@ -65,6 +67,16 @@ final class Client
         return $this->request('GET', $path);
     }
 
+    /**
+     * Public request without the API key, on the domain search service.
+     * A custom transport receives the absolute URL as its path.
+     * @return array<string, mixed>
+     */
+    public function publicDomainSearch(string $pathAndQuery): array
+    {
+        return $this->request('GET', $pathAndQuery, null, null, $this->domainSearchUrl, false);
+    }
+
     /** @param array<string, mixed>|null $body @return array<string, mixed> */
     public function mutate(string $method, string $path, ?array $body = null, ?string $idempotencyKey = null): array
     {
@@ -72,12 +84,12 @@ final class Client
     }
 
     /** @param array<string, mixed>|null $body @return array<string, mixed> */
-    private function request(string $method, string $path, ?array $body = null, ?string $idempotencyKey = null): array
+    private function request(string $method, string $path, ?array $body = null, ?string $idempotencyKey = null, ?string $baseUrl = null, bool $authenticated = true): array
     {
-        $headers = [
-            'Accept: application/json',
-            "Authorization: Bearer {$this->apiKey}",
-        ];
+        $headers = ['Accept: application/json'];
+        if ($authenticated) {
+            $headers[] = "Authorization: Bearer {$this->apiKey}";
+        }
         if ($idempotencyKey !== null) {
             $headers[] = "Idempotency-Key: {$idempotencyKey}";
         }
@@ -87,7 +99,7 @@ final class Client
         }
 
         if ($this->transport !== null) {
-            $response = ($this->transport)($method, $path, $body, $headers, $idempotencyKey);
+            $response = ($this->transport)($method, $baseUrl === null ? $path : $baseUrl . $path, $body, $headers, $idempotencyKey);
             $status = (int) ($response['status'] ?? 200);
             $payload = is_array($response['body'] ?? null) ? $response['body'] : ['data' => $response['body'] ?? null];
             if ($status < 200 || $status >= 300) {
@@ -103,7 +115,7 @@ final class Client
             return $payload;
         }
 
-        $curl = curl_init($this->baseUrl . $path);
+        $curl = curl_init(($baseUrl ?? $this->baseUrl) . $path);
         if ($curl === false) {
             throw new RuntimeException('Unable to initialize the HTTP client.');
         }
@@ -234,6 +246,21 @@ final class DomainsResource extends Resource
     public function setNameservers(string $domainId, array $nameServers, ?string $idempotencyKey = null): array
     {
         return $this->client->mutate('PUT', '/v1/domains/' . $this->id($domainId) . '/nameservers', ['nameServers' => $nameServers], $idempotencyKey);
+    }
+
+    /**
+     * Check availability and price of 1 to 20 domains. Public endpoint on domain.kmerhosting.com:
+     * no API key is sent; limited to 20 requests per IP per minute (a bulk search counts once).
+     * @param string|list<string> $domains
+     * @return array<string, mixed> ['results' => [...]]
+     */
+    public function search(string|array $domains): array
+    {
+        $list = array_values(array_filter(array_map('trim', is_array($domains) ? $domains : [$domains]), static fn (string $d): bool => $d !== ''));
+        if (count($list) < 1 || count($list) > 20) {
+            throw new \InvalidArgumentException('Pass between 1 and 20 domains to domains()->search().');
+        }
+        return $this->client->publicDomainSearch('/api/domain-search?' . http_build_query(['domains' => implode(',', $list)]));
     }
 }
 
