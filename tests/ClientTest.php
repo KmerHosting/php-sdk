@@ -96,4 +96,26 @@ try {
     }
 }
 
-echo "PHP SDK contract tests passed (42 operations)\n";
+$searches = [];
+$searchClient = new Client('kh_live_test', 'https://example.test', 30, static function (string $method, string $path, ?array $body, array $headers) use (&$searches): array {
+    $searches[] = compact('method', 'path', 'headers');
+    return ['status' => 200, 'body' => ['results' => [['domainName' => 'example.com'], ['domainName' => 'example.cm']]]];
+}, 'https://domain.example.test/');
+$result = $searchClient->domains()->search(['example.com', ' example.cm ']);
+if (count($result['results']) !== 2 || $searches[0]['method'] !== 'GET' || $searches[0]['path'] !== 'https://domain.example.test/api/domain-search?domains=example.com%2Cexample.cm') {
+    throw new RuntimeException('Domain search contract mismatch');
+}
+foreach ($searches[0]['headers'] as $header) {
+    if (str_starts_with($header, 'Authorization:')) {
+        throw new RuntimeException('Domain search must not send the API key');
+    }
+}
+foreach ([[], array_map(static fn (int $i): string => "d{$i}.com", range(1, 21))] as $invalid) {
+    try {
+        $searchClient->domains()->search($invalid);
+        throw new RuntimeException('Expected InvalidArgumentException');
+    } catch (InvalidArgumentException) {
+    }
+}
+
+echo "PHP SDK contract tests passed (42 operations + domain search)\n";
