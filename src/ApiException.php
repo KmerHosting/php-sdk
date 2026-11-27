@@ -6,7 +6,7 @@ namespace KmerHosting;
 
 use RuntimeException;
 
-final class ApiException extends RuntimeException
+class ApiException extends RuntimeException
 {
     public function __construct(
         string $message,

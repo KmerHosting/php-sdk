@@ -3,10 +3,12 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/../src/ApiException.php';
+require_once __DIR__ . '/../src/RateLimitException.php';
 require_once __DIR__ . '/../src/Client.php';
 
 use KmerHosting\ApiException;
 use KmerHosting\Client;
+use KmerHosting\RateLimitException;
 
 $id = '22222222-2222-4222-8222-222222222222';
 $recordId = '33333333-3333-4333-8333-333333333333';
@@ -116,6 +118,56 @@ foreach ([[], array_map(static fn (int $i): string => "d{$i}.com", range(1, 21))
         throw new RuntimeException('Expected InvalidArgumentException');
     } catch (InvalidArgumentException) {
     }
+}
+
+// Retries: 429 honors Retry-After, 502 uses bounded backoff, the idempotency key is reused.
+$attempts = [];
+$waits = [];
+$script = [
+    ['status' => 429, 'headers' => ['Retry-After' => '2', 'X-RateLimit-Limit' => '60', 'X-RateLimit-Remaining' => '0'], 'body' => ['error' => ['code' => 'rate_limit_exceeded', 'message' => 'slow down', 'request_id' => 'r1']]],
+    ['status' => 502, 'body' => []],
+    ['status' => 202, 'body' => ['data' => ['ok' => true], 'request_id' => 'r2']],
+];
+$retryClient = new Client('kh_live_test', 'https://example.test', 30, static function (string $method, string $path, ?array $body, array $headers, ?string $key) use (&$attempts, $script): array {
+    $attempts[] = $key;
+    return $script[min(count($attempts) - 1, count($script) - 1)];
+}, 'https://domain.example.test', 3, static function (float $seconds) use (&$waits): void {
+    $waits[] = $seconds;
+});
+$retryClient->kvm()->action($id, 'restart');
+if (count($attempts) !== 3 || count(array_unique($attempts)) !== 1 || $attempts[0] === null) {
+    throw new RuntimeException('Retries must reuse the same idempotency key');
+}
+if ($waits[0] < 2.0 || $waits[0] > 2.3 || $waits[1] > 1.0) {
+    throw new RuntimeException('Unexpected retry delays');
+}
+
+$attempts = [];
+$limitedClient = new Client('kh_live_test', 'https://example.test', 30, static function () use (&$attempts): array {
+    $attempts[] = 1;
+    return ['status' => 429, 'headers' => ['retry-after' => '7', 'x-ratelimit-limit' => '60', 'x-ratelimit-remaining' => '0'], 'body' => ['error' => ['code' => 'rate_limit_exceeded', 'message' => 'slow down']]];
+}, 'https://domain.example.test', 3, static function (float $seconds): void {
+});
+try {
+    $limitedClient->account()->get();
+    throw new RuntimeException('Expected RateLimitException');
+} catch (RateLimitException $error) {
+    if (count($attempts) !== 3 || $error->retryAfter !== 7.0 || $error->limit !== 60 || $error->status !== 429 || !($error instanceof ApiException)) {
+        throw new RuntimeException('RateLimitException contract mismatch');
+    }
+}
+
+$attempts = [];
+$noRetry = new Client('kh_live_test', 'https://example.test', 30, static function () use (&$attempts): array {
+    $attempts[] = 1;
+    return ['status' => 503, 'body' => []];
+}, 'https://domain.example.test', 1);
+try {
+    $noRetry->account()->get();
+} catch (ApiException) {
+}
+if (count($attempts) !== 1) {
+    throw new RuntimeException('maxAttempts=1 must disable retries');
 }
 
 echo "PHP SDK contract tests passed (42 operations + domain search)\n";
