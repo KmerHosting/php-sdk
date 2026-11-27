@@ -14,9 +14,20 @@ final class Client
     private string $domainSearchUrl;
     /** @var callable|null */
     private $transport;
+    /** @var callable */
+    private $sleep;
+    private int $maxAttempts;
 
-    public function __construct(?string $apiKey = null, string $baseUrl = 'https://api.kmerhosting.com', private readonly int $timeout = 30, ?callable $transport = null, string $domainSearchUrl = 'https://domain.kmerhosting.com')
+    /**
+     * @param int $maxAttempts Total tries for 429/502/503/504 responses (1 disables retries).
+     * @param callable|null $sleep Receives the wait in seconds (float); defaults to usleep.
+     */
+    public function __construct(?string $apiKey = null, string $baseUrl = 'https://api.kmerhosting.com', private readonly int $timeout = 30, ?callable $transport = null, string $domainSearchUrl = 'https://domain.kmerhosting.com', int $maxAttempts = 3, ?callable $sleep = null, private readonly float $retryBaseDelay = 0.5, private readonly float $retryMaxDelay = 60.0)
     {
+        $this->maxAttempts = max(1, $maxAttempts);
+        $this->sleep = $sleep ?? static function (float $seconds): void {
+            usleep((int) round($seconds * 1_000_000));
+        };
         $this->apiKey = $apiKey ?: (getenv('KMERHOSTING_API_KEY') ?: '');
         if ($this->apiKey === '') {
             throw new RuntimeException('Set KMERHOSTING_API_KEY or pass an API key to Client.');
@@ -98,21 +109,35 @@ final class Client
             $headers[] = 'Content-Type: application/json';
         }
 
+        for ($attempt = 1;; $attempt++) {
+            // Same headers (including Idempotency-Key) and body on every attempt.
+            [$status, $payload, $responseHeaders] = $this->perform($method, $path, $body, $headers, $idempotencyKey, $baseUrl);
+            if ($status >= 200 && $status < 300) {
+                return $payload;
+            }
+            if (in_array($status, [429, 502, 503, 504], true) && $attempt < $this->maxAttempts) {
+                ($this->sleep)($this->retryDelay($attempt, $this->retryAfter($responseHeaders)));
+                continue;
+            }
+            throw $this->errorFor($status, $payload, $responseHeaders);
+        }
+    }
+
+    /**
+     * @param array<string, mixed>|null $body
+     * @param list<string> $headers
+     * @return array{0: int, 1: array<string, mixed>, 2: array<string, string>}
+     */
+    private function perform(string $method, string $path, ?array $body, array $headers, ?string $idempotencyKey, ?string $baseUrl): array
+    {
         if ($this->transport !== null) {
             $response = ($this->transport)($method, $baseUrl === null ? $path : $baseUrl . $path, $body, $headers, $idempotencyKey);
-            $status = (int) ($response['status'] ?? 200);
             $payload = is_array($response['body'] ?? null) ? $response['body'] : ['data' => $response['body'] ?? null];
-            if ($status < 200 || $status >= 300) {
-                $error = is_array($payload['error'] ?? null) ? $payload['error'] : [];
-                throw new ApiException(
-                    (string) ($error['message'] ?? "KmerHosting API request failed with status {$status}."),
-                    $status,
-                    (string) ($error['code'] ?? 'request_failed'),
-                    isset($error['request_id']) ? (string) $error['request_id'] : null,
-                    $payload,
-                );
+            $responseHeaders = [];
+            foreach ((array) ($response['headers'] ?? []) as $name => $value) {
+                $responseHeaders[strtolower((string) $name)] = (string) $value;
             }
-            return $payload;
+            return [(int) ($response['status'] ?? 200), $payload, $responseHeaders];
         }
 
         $curl = curl_init(($baseUrl ?? $this->baseUrl) . $path);
@@ -120,6 +145,7 @@ final class Client
             throw new RuntimeException('Unable to initialize the HTTP client.');
         }
 
+        $responseHeaders = [];
         curl_setopt_array($curl, [
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_HTTPHEADER => $headers,
@@ -128,6 +154,13 @@ final class Client
             CURLOPT_CONNECTTIMEOUT => min($this->timeout, 10),
             CURLOPT_FAILONERROR => false,
             CURLOPT_POSTFIELDS => $body === null ? null : json_encode($body, JSON_THROW_ON_ERROR),
+            CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use (&$responseHeaders): int {
+                $parts = explode(':', $line, 2);
+                if (count($parts) === 2) {
+                    $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
+                }
+                return strlen($line);
+            },
         ]);
 
         $raw = curl_exec($curl);
@@ -137,22 +170,65 @@ final class Client
             throw new RuntimeException($message);
         }
         $status = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-        $requestId = null;
         curl_close($curl);
 
-        $payload = $this->decode($raw);
-        if ($status < 200 || $status >= 300) {
-            $error = is_array($payload['error'] ?? null) ? $payload['error'] : [];
-            throw new ApiException(
-                (string) ($error['message'] ?? "KmerHosting API request failed with status {$status}."),
-                $status,
-                (string) ($error['code'] ?? 'request_failed'),
-                isset($error['request_id']) ? (string) $error['request_id'] : $requestId,
+        return [$status, $this->decode($raw), $responseHeaders];
+    }
+
+    /** @param array<string, string> $headers */
+    private function retryAfter(array $headers): ?float
+    {
+        $value = $headers['retry-after'] ?? null;
+        if ($value === null || $value === '') {
+            return null;
+        }
+        if (is_numeric($value)) {
+            return max(0.0, (float) $value);
+        }
+        $time = strtotime($value);
+        return $time === false ? null : max(0.0, (float) ($time - time()));
+    }
+
+    private function retryDelay(int $attempt, ?float $retryAfter): float
+    {
+        if ($retryAfter !== null) {
+            $delay = $retryAfter + mt_rand(0, 250) / 1000;
+        } else {
+            $delay = mt_rand(0, 1000) / 1000 * min($this->retryMaxDelay, $this->retryBaseDelay * (2 ** ($attempt - 1)));
+        }
+        return min($this->retryMaxDelay, $delay);
+    }
+
+    /**
+     * @param array<string, mixed> $payload
+     * @param array<string, string> $headers
+     */
+    private function errorFor(int $status, array $payload, array $headers): ApiException
+    {
+        $error = is_array($payload['error'] ?? null) ? $payload['error'] : [];
+        if (!is_array($payload['error'] ?? null) && is_string($payload['error'] ?? null)) {
+            // The public domain-search service answers {"error": "<code>", "message": "..."}.
+            $error = ['code' => $payload['error'], 'message' => $payload['message'] ?? null];
+        }
+        $requestId = isset($error['request_id']) ? (string) $error['request_id'] : ($headers['x-request-id'] ?? null);
+        if ($status === 429) {
+            return new RateLimitException(
+                (string) ($error['message'] ?? 'KmerHosting API rate limit exceeded.'),
+                (string) ($error['code'] ?? 'rate_limit_exceeded'),
+                $requestId,
                 $payload,
+                $this->retryAfter($headers),
+                isset($headers['x-ratelimit-limit']) ? (int) $headers['x-ratelimit-limit'] : null,
+                isset($headers['x-ratelimit-remaining']) ? (int) $headers['x-ratelimit-remaining'] : null,
             );
         }
-
-        return $payload;
+        return new ApiException(
+            (string) ($error['message'] ?? "KmerHosting API request failed with status {$status}."),
+            $status,
+            (string) ($error['code'] ?? 'request_failed'),
+            $requestId,
+            $payload,
+        );
     }
 
     /** @return array<string, mixed> */
